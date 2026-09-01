@@ -1,5 +1,3 @@
-# moondungeon
-
 # LOAD-BEARING MOON
 
 a friction engine. a dungeon that tells you no.
