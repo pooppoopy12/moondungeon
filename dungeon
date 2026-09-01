@@ -1,0 +1,812 @@
+#!/usr/bin/env python3
+"""
+LOAD-BEARING MOON
+a friction engine — v0.1 "the mute engine"
+
+A dungeon that tells you no.
+
+  python3 dungeon.py new --seed some-phrase-you-like
+  python3 dungeon.py do "your turn, in as many words as you want"
+  ...repeat...
+  (walk back to the door you came in by, and: leave)
+
+Or run with no arguments in a real terminal for interactive play.
+
+Design notes:
+- The world is generated deterministically from the seed. The engine
+  regenerates it fresh every turn; only your position, pockets, and
+  consequences are saved. The map is hidden from you by fog of war and,
+  ultimately, by your own choice not to read this file's generator.
+- Say as much as you like. The dungeon will keep one verb and compost
+  the rest. The rest was still yours.
+- Leaving is an ending, not a failure. The door is marked from turn one.
+- The graveyard keeps one line per run, forever, for whoever comes next.
+
+stdlib only. yoink freely.
+"""
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import random
+import re
+import sys
+import textwrap
+
+# ----------------------------------------------------------------------
+# word banks
+# ----------------------------------------------------------------------
+
+ADJ = ["Velvet", "Sunken", "Chalk", "Hollow", "Patient", "Unlit", "Marrow",
+       "Tin", "Moth-Eaten", "Vaulted", "Damp", "Borrowed", "Thin-Walled",
+       "Salt", "Crooked", "Fasting", "Overwintered", "Load-Bearing"]
+
+NOUN = ["Vestibule", "Rotunda", "Stair", "Larder", "Chapel", "Archive",
+        "Cistern", "Gallery", "Burrow", "Antechamber", "Undercroft",
+        "Scriptorium", "Cloakroom", "Well-House", "Solar", "Bonery"]
+
+FLAVOR = [
+    "The ceiling is lower than it sounds.",
+    "Someone swept here once, decisively, and never again.",
+    "The air has the texture of a held breath.",
+    "Water is negotiating with stone somewhere out of sight.",
+    "The walls have been leaned on.",
+    "It smells faintly of a library's opinion of rain.",
+    "The dust here has seniority.",
+    "An old draft moves through like it pays rent.",
+    "The stones fit together the way strangers share a bench.",
+    "Every echo comes back slightly edited.",
+    "The dark in the corners is the permanent kind.",
+    "Something was stored here for a long time and then forgiven.",
+    "The floor slopes toward a drain that has never once been thanked.",
+    "You get the sense the room is between errands.",
+    "It is exactly as cold as a doorknob.",
+    "The silence is load-bearing.",
+]
+
+ITEMS = ["tin key", "stub of candle", "cold lantern", "river stone",
+         "bell with no clapper", "folded map (blank)", "dry mushroom",
+         "coil of twine", "small honest mirror", "spent match"]
+
+FEATURES = ["a lever labeled DO NOT", "a pool reflecting the wrong ceiling",
+            "a shelf of mushrooms at exactly ear height",
+            "an inscription worn to punctuation", "a bricked-up doorway",
+            "a chair facing the wall", "a niche the size of a loaf",
+            "a bell-rope going up into the dark"]
+
+WANDERER = ["something with too many footsteps",
+            "something with your exact posture",
+            "something carrying a lantern it will not share",
+            "something with borrowed antlers",
+            "something that files its steps for later"]
+
+TRUE_THING_A = ["The door", "The dark", "Every map", "The first room",
+                "What you carry", "The echo", "Patience", "The way out"]
+TRUE_THING_B = ["was never locked", "is also waiting", "ends at the margin",
+                "remembers you fondly", "weighs what you fed it",
+                "arrives before you", "is a room too", "was the way in"]
+
+RETAINED_TEMPLATES = [
+    '[The dungeon acknowledges your {n} words and has retained: "{kept}."]',
+    '[Your {n} words have been received. Kept for the record: "{kept}." The rest has been composted.]',
+    '[{n} words. The dungeon has kept "{kept}" and put the rest in the archive it does not have.]',
+    '[Noted, all {n} words of it. Retained: "{kept}."]',
+]
+
+NOTHING_TEMPLATES = [
+    "[The dungeon acknowledges your {n} words and has retained: nothing. It waits.]",
+    "[{n} words, none of them load-bearing. Time passes anyway.]",
+    "[The dungeon listens the way stone listens: completely, and without effect. Time passes.]",
+]
+
+VERBS = {
+    "go": "go", "walk": "go", "head": "go", "stride": "go", "move": "go",
+    "north": "north", "south": "south", "east": "east", "west": "west",
+    "look": "look", "examine": "examine", "inspect": "examine",
+    "study": "examine", "read": "examine",
+    "take": "take", "grab": "take", "get": "take", "pocket": "take",
+    "drop": "drop", "leave-behind": "drop",
+    "open": "open", "unlock": "open", "use": "use",
+    "light": "light", "eat": "eat", "taste": "eat", "drink": "eat",
+    "talk": "talk", "speak": "talk", "say": "talk", "ask": "talk",
+    "listen": "listen", "wait": "wait", "rest": "wait",
+    "pull": "pull", "ring": "ring", "dig": "dig",
+    "map": "map", "inventory": "inventory", "pockets": "inventory",
+    "help": "help", "verbs": "help",
+    "leave": "leave", "quit": "leave", "exit": "leave", "out": "leave",
+}
+
+STOPWORDS = set("the a an at to into in on of my your this that with and "
+                "then very toward towards through i we".split())
+
+DIRS = {"north": (0, -1), "south": (0, 1), "east": (1, 0), "west": (-1, 0)}
+OPP = {"north": "south", "south": "north", "east": "west", "west": "east"}
+
+# ----------------------------------------------------------------------
+# deterministic rng
+# ----------------------------------------------------------------------
+
+def rng_for(seed, *salt):
+    h = hashlib.sha256(("|".join([seed] + [str(s) for s in salt])).encode())
+    return random.Random(int(h.hexdigest(), 16))
+
+# ----------------------------------------------------------------------
+# worldgen — regenerated from seed every load; never stored
+# ----------------------------------------------------------------------
+
+def generate_world(seed):
+    r = rng_for(seed, "world")
+    n_rooms = 14
+
+    # random walk on a grid
+    coords = [(0, 0)]
+    occupied = {(0, 0)}
+    tries = 0
+    while len(coords) < n_rooms and tries < 4000:
+        tries += 1
+        base = r.choice(coords)
+        d = r.choice(list(DIRS.values()))
+        c = (base[0] + d[0], base[1] + d[1])
+        if c not in occupied:
+            occupied.add(c)
+            coords.append(c)
+
+    adj = {}
+    for c in coords:
+        adj[c] = {}
+        for dname, d in DIRS.items():
+            t = (c[0] + d[0], c[1] + d[1])
+            if t in occupied:
+                adj[c][dname] = t
+
+    names = {}
+    pairs = [(a, b) for a in ADJ for b in NOUN]
+    r.shuffle(pairs)
+    for i, c in enumerate(coords):
+        if c == (0, 0):
+            names[c] = "The Doorstep"
+        else:
+            a, b = pairs[i]
+            names[c] = "The %s %s" % (a, b)
+
+    flavors = {c: r.choice(FLAVOR) for c in coords}
+
+    # dark rooms (not the doorstep)
+    interior = [c for c in coords if c != (0, 0)]
+    dark = set(r.sample(interior, min(3, len(interior))))
+
+    # farthest room by BFS = the deep room; secret lives there
+    dist = {(0, 0): 0}
+    frontier = [(0, 0)]
+    while frontier:
+        nxt = []
+        for c in frontier:
+            for t in adj[c].values():
+                if t not in dist:
+                    dist[t] = dist[c] + 1
+                    nxt.append(t)
+        frontier = nxt
+    deep = max(coords, key=lambda c: dist.get(c, 0))
+    dark.add(deep)  # the deep room is always dark
+
+    # one locked edge on the path toward the deep room, if possible
+    locked = None
+    path_room = deep
+    while dist.get(path_room, 0) > 1:
+        for dname, t in adj[path_room].items():
+            if dist.get(t, 99) == dist[path_room] - 1:
+                locked = tuple(sorted([path_room, t]))
+                path_room = t
+                break
+        if locked:
+            break
+
+    # items scattered in near rooms (key never behind the lock)
+    near = [c for c in coords if c != (0, 0) and
+            (locked is None or dist[c] <= dist[min(locked, key=lambda x: dist[x])])]
+    r.shuffle(near)
+    room_items = {str(c): [] for c in coords}
+    placed = ITEMS[:]
+    r.shuffle(placed)
+    for i, item in enumerate(placed[:7]):
+        spot = near[i % len(near)] if near else r.choice(interior)
+        room_items[str(spot)].append(item)
+
+    features = {}
+    feat_rooms = r.sample(interior, min(4, len(interior)))
+    fpool = FEATURES[:]
+    r.shuffle(fpool)
+    for i, c in enumerate(feat_rooms):
+        features[str(c)] = fpool[i]
+
+    true_thing = "%s %s." % (r.choice(TRUE_THING_A), r.choice(TRUE_THING_B))
+    wanderer = r.choice(WANDERER)
+    wstart = deep
+
+    return {
+        "coords": coords, "adj": adj, "names": names, "flavors": flavors,
+        "dark": dark, "deep": deep, "locked": locked,
+        "room_items_init": room_items, "features": features,
+        "true_thing": true_thing, "wanderer": wanderer, "wstart": wstart,
+    }
+
+# ----------------------------------------------------------------------
+# state
+# ----------------------------------------------------------------------
+
+def new_state(seed):
+    w = generate_world(seed)
+    return {
+        "seed": seed,
+        "pos": [0, 0],
+        "turn": 0,
+        "phase": "playing",       # playing | epitaph | done
+        "inventory": [],
+        "visited": [[0, 0]],
+        "room_items": w["room_items_init"],
+        "wanderer": list(w["wstart"]),
+        "candle_lit": 0,           # turns of light remaining
+        "lantern_lit": False,
+        "unlocked": False,
+        "secret_found": False,
+        "lever_pulled": False,
+        "words_offered": 0,
+        "words_kept": 0,
+        "escorted": False,
+        "log_kept": [],
+    }
+
+def ckey(c):
+    return str(tuple(c))
+
+def lit(state):
+    return state["candle_lit"] > 0 or state["lantern_lit"]
+
+# ----------------------------------------------------------------------
+# parser — the forgiving one
+# ----------------------------------------------------------------------
+
+SINGLES = {"i": "inventory", "l": "look", "n": "north", "s": "south",
+           "e": "east", "w": "west"}
+
+def parse(raw):
+    whole = raw.strip().lower()
+    if whole in SINGLES:
+        return SINGLES[whole], None, 1
+    words = re.findall(r"[a-zA-Z'-]+", raw.lower())
+    n = len(re.findall(r"\S+", raw))
+    verb, obj = None, None
+    for i, wd in enumerate(words):
+        if wd in VERBS:
+            verb = VERBS[wd]
+            rest = [x for x in words[i + 1:] if x not in STOPWORDS]
+            if verb == "go" and rest and rest[0] in VERBS and VERBS[rest[0]] in DIRS:
+                verb = VERBS[rest[0]]
+                rest = rest[1:]
+            obj = " ".join(rest[:3]) if rest else None
+            break
+    return verb, obj, n
+
+def retained_line(seed, turn, n, kept):
+    r = rng_for(seed, "retain", turn)
+    if kept is None:
+        return r.choice(NOTHING_TEMPLATES).format(n=n)
+    return r.choice(RETAINED_TEMPLATES).format(n=n, kept=kept)
+
+# ----------------------------------------------------------------------
+# describing rooms
+# ----------------------------------------------------------------------
+
+def describe(w, state, brief=False):
+    c = tuple(state["pos"])
+    out = [w["names"][c]]
+    dark_here = c in w["dark"] and not lit(state)
+    if dark_here:
+        out.append("It is dark. Your other senses volunteer nothing useful.")
+    else:
+        if not brief:
+            out.append(w["flavors"][c])
+        items = state["room_items"].get(ckey(c), [])
+        if items:
+            out.append("Here: " + ", ".join(items) + ".")
+        f = w["features"].get(ckey(c))
+        if f:
+            out.append("There is " + f + ".")
+        if c == (0, 0):
+            out.append("The door you came in by is here. It has always been here.")
+        if c == w["deep"] and lit(state) and not state["secret_found"]:
+            out.append("The light finds writing on the far wall.")
+    exits = sorted(w["adj"][c].keys())
+    out.append("Exits: " + ", ".join(exits) + ".")
+    if tuple(state["wanderer"]) == c and not dark_here:
+        out.append("It is here: %s. It has noticed you noticing." % w["wanderer"])
+    return "\n".join(out)
+
+def draw_map(w, state):
+    vis = {tuple(v) for v in state["visited"]}
+    xs = [c[0] for c in vis]
+    ys = [c[1] for c in vis]
+    lines = ["(what you have seen)"]
+    for y in range(min(ys), max(ys) + 1):
+        row = ""
+        for x in range(min(xs), max(xs) + 1):
+            c = (x, y)
+            if c == tuple(state["pos"]):
+                row += " @ "
+            elif c == (0, 0) and c in vis:
+                row += " D "
+            elif c in vis:
+                row += " # "
+            else:
+                row += "   "
+        lines.append(row)
+    lines.append("@ you · D the door · # somewhere you have been")
+    return "\n".join(lines)
+
+# ----------------------------------------------------------------------
+# the wanderer
+# ----------------------------------------------------------------------
+
+def move_wanderer(w, state, out):
+    r = rng_for(state["seed"], "wander", state["turn"])
+    c = tuple(state["wanderer"])
+    options = list(w["adj"][c].values()) + [c]
+    newc = r.choice(options)
+    state["wanderer"] = list(newc)
+    p = tuple(state["pos"])
+    if newc == p:
+        roll = rng_for(state["seed"], "dice", state["turn"]).randint(1, 20)
+        dark_here = p in w["dark"] and not lit(state)
+        if dark_here:
+            out.append("Footsteps, plural, share the dark with you. They pass "
+                       "close enough to borrow your warmth.")
+            return
+        if roll == 1:
+            state["escorted"] = True
+            out.append("%s arrives all at once. It looks at you the way a "
+                       "closing time looks at a customer." % w["wanderer"].capitalize())
+            out.append("The dungeon has decided you are done. You are shown "
+                       "the door with great courtesy.")
+        elif roll >= 19:
+            gift = rng_for(state["seed"], "gift", state["turn"]).choice(
+                ["a small brass tooth", "a pressed fern", "an apology, folded"])
+            state["inventory"].append(gift)
+            out.append("%s is here. It sets down %s in front of you, "
+                       "and files its steps elsewhere." % (w["wanderer"].capitalize(), gift))
+        elif roll <= 5 and state["inventory"]:
+            take = rng_for(state["seed"], "theft", state["turn"]).choice(state["inventory"])
+            state["inventory"].remove(take)
+            out.append("%s moves through the room and now you do not have "
+                       "the %s. These facts are related." % (w["wanderer"].capitalize(), take))
+        else:
+            out.append("%s is here. It regards you. You are being remembered "
+                       "at it." % w["wanderer"].capitalize())
+    elif newc in w["adj"].get(p, {}).values():
+        out.append("(Footsteps, plural, in an adjacent room.)")
+
+# ----------------------------------------------------------------------
+# one turn
+# ----------------------------------------------------------------------
+
+def apply_turn(w, state, raw):
+    out = []
+    verb, obj, n = parse(raw)
+
+    if state["phase"] == "epitaph":
+        line = " ".join(raw.split())
+        write_epitaph(state, line)
+        out.append("It is kept. The door closes behind you the way a book closes.")
+        out.append("")
+        out.append(read_graveyard())
+        state["phase"] = "done"
+        return "\n".join(out)
+
+    state["words_offered"] += n
+    kept = None
+    if verb:
+        kept = verb + ((" " + obj) if obj and verb not in
+                       ("map", "inventory", "help", "look", "wait", "leave",
+                        "listen", "north", "south", "east", "west") else "")
+        state["words_kept"] += len(kept.split())
+        state["log_kept"].append(kept)
+    if n >= 12 or verb is None:
+        out.append(retained_line(state["seed"], state["turn"], n, kept))
+
+    consumed = True  # most things take time
+    c = tuple(state["pos"])
+
+    if verb is None:
+        pass  # time passes; the wanderer gets a turn
+
+    elif verb in DIRS:
+        t = w["adj"][c].get(verb)
+        if not t:
+            out.append("No. That way is wall.")
+            consumed = False
+        elif (w["locked"] and tuple(sorted([c, t])) == w["locked"]
+              and not state["unlocked"]):
+            out.append("A door, locked, with a keyhole sized for tin. "
+                       "It declines you politely.")
+        else:
+            state["pos"] = list(t)
+            if list(t) not in state["visited"]:
+                state["visited"].append(list(t))
+            if state["candle_lit"] > 0:
+                state["candle_lit"] -= 1
+                if state["candle_lit"] == 0:
+                    out.append("(The candle finishes. The dark resumes its shift.)")
+            out.append(describe(w, state))
+
+    elif verb == "look":
+        out.append(describe(w, state))
+        consumed = False
+
+    elif verb == "map":
+        out.append(draw_map(w, state))
+        consumed = False
+
+    elif verb == "inventory":
+        if state["inventory"]:
+            out.append("You have: " + ", ".join(state["inventory"]) + ".")
+        else:
+            out.append("Your pockets contain the idea of pockets.")
+        consumed = False
+
+    elif verb == "help":
+        out.append("The dungeon answers to: go/north/south/east/west, look, "
+                   "examine <x>, take <x>, drop <x>, open, use <x>, light <x>, "
+                   "eat <x>, talk, listen, wait, pull, ring, dig, map, "
+                   "inventory, leave.")
+        out.append("Everything else you say is yours.")
+        consumed = False
+
+    elif verb == "take":
+        items = state["room_items"].get(ckey(c), [])
+        dark_here = c in w["dark"] and not lit(state)
+        match = find_item(obj, items) if not dark_here else None
+        if dark_here and items:
+            out.append("You pat the dark. The dark pats back. Nothing comes of it.")
+        elif match:
+            items.remove(match)
+            state["inventory"].append(match)
+            out.append("Taken: %s." % match)
+        elif obj in ("everything", "all", "whatever") and items:
+            state["inventory"].extend(items)
+            out.append("Taken: " + ", ".join(items) + ". All of it. The room "
+                       "watches you do this.")
+            del items[:]
+        elif obj and "moon" in obj:
+            out.append("The moon stays. The moon is load-bearing.")
+            consumed = False
+        elif not obj:
+            out.append("Take what? The dungeon is not a buffet.")
+            consumed = False
+        else:
+            out.append("No.")
+            consumed = False
+
+    elif verb == "drop":
+        match = find_item(obj, state["inventory"])
+        if match:
+            state["inventory"].remove(match)
+            state["room_items"].setdefault(ckey(c), []).append(match)
+            out.append("You set down the %s. The room accepts custody." % match)
+        else:
+            out.append("You are not carrying that. Few are.")
+            consumed = False
+
+    elif verb == "examine":
+        out.append(do_examine(w, state, obj))
+        consumed = False
+
+    elif verb == "light":
+        match = find_item(obj, state["inventory"]) if obj else find_item("candle", state["inventory"])
+        if match and "candle" in match:
+            state["candle_lit"] = 30
+            out.append("The candle takes. The dark steps back exactly one pace, "
+                       "on principle.")
+            if c in w["dark"]:
+                out.append(describe(w, state))
+        elif match and "lantern" in match:
+            out.append("The lantern is cold and intends to stay that way. "
+                       "It is a lantern of principle.")
+        else:
+            out.append("You have nothing that agrees to burn.")
+            consumed = False
+
+    elif verb == "open":
+        if obj and "door" in (obj or "") and c == (0, 0):
+            out.append("It was never locked. Leave, if you mean it.")
+            consumed = False
+        else:
+            adj_locked = any(w["locked"] and tuple(sorted([c, t])) == w["locked"]
+                             for t in w["adj"][c].values())
+            if adj_locked and not state["unlocked"]:
+                if find_item("tin key", state["inventory"]):
+                    state["unlocked"] = True
+                    out.append("The tin key turns with the sound of a small "
+                               "decision. The lock retires.")
+                else:
+                    out.append("Locked. The keyhole is sized for tin and "
+                               "your fingers are not.")
+            else:
+                out.append("Nothing here is closed in a way you can help with.")
+                consumed = False
+
+    elif verb == "use":
+        if obj and "key" in obj:
+            return apply_turn_inner_open(w, state, out)
+        out.append("The dungeon prefers specific verbs. It is old-fashioned "
+                   "that way.")
+        consumed = False
+
+    elif verb == "eat":
+        match = find_item(obj, state["inventory"]) or (obj or "")
+        if "mushroom" in str(match):
+            if find_item("mushroom", state["inventory"]):
+                state["inventory"].remove(find_item("mushroom", state["inventory"]))
+            out.append("You eat the mushroom. It tastes of attic and, briefly, "
+                       "of a summer you did not attend. You feel archived.")
+        else:
+            thing = obj or "that"
+            out.append("You cannot eat the %s. The %s is load-bearing." % (thing, thing))
+            consumed = False
+
+    elif verb == "talk":
+        if tuple(state["wanderer"]) == c:
+            roll = rng_for(state["seed"], "voice", state["turn"]).randint(1, 20)
+            if roll >= 18:
+                word = rng_for(state["seed"], "word", state["turn"]).choice(
+                    ["'Soon.'", "'Again?'", "'Careful.'", "'Yours.'"])
+                out.append("It considers for a long time, and says: %s "
+                           "It does not elaborate." % word)
+            else:
+                out.append("It listens the way stone listens: completely, "
+                           "and without effect.")
+        else:
+            out.append("You address the room. The room takes it under advisement.")
+
+    elif verb == "listen":
+        wp = tuple(state["wanderer"])
+        if wp == c:
+            out.append("Breathing. Some of it is yours.")
+        elif wp in w["adj"][c].values():
+            out.append("Footsteps, plural, one room over.")
+        else:
+            out.append("Water, stone, and the long administrative hum of "
+                       "the dark.")
+        consumed = False
+
+    elif verb == "wait":
+        out.append("Time passes. It had to.")
+
+    elif verb == "pull":
+        f = w["features"].get(ckey(c), "")
+        if "lever" in f and not state["lever_pulled"]:
+            state["lever_pulled"] = True
+            out.append("You pull the lever labeled DO NOT. Somewhere, "
+                       "something changes hands. Nothing here admits to it.")
+        elif "lever" in f:
+            out.append("The lever has already been pulled. It says DO NOT "
+                       "with new bitterness.")
+            consumed = False
+        elif "bell-rope" in f:
+            out.append("You pull the rope. Far above, a bell swings "
+                       "silently — the clapper is elsewhere, and you may "
+                       "even know where.")
+        else:
+            out.append("There is nothing here that wants pulling.")
+            consumed = False
+
+    elif verb == "ring":
+        if find_item("bell", state["inventory"]):
+            out.append("You swing the clapperless bell. It rings anyway, "
+                       "once, in a frequency only the dungeon can hear. "
+                       "Far off: footsteps, plural, pausing.")
+        else:
+            out.append("With what?")
+            consumed = False
+
+    elif verb == "dig":
+        out.append("The floor is stone and the stone is senior to you.")
+        consumed = False
+
+    elif verb == "leave":
+        if c == (0, 0):
+            return do_leave(w, state, out)
+        else:
+            out.append("The door is where you left it.")
+            consumed = False
+
+    if state["phase"] == "playing" and consumed and not state["escorted"]:
+        state["turn"] += 1
+        move_wanderer(w, state, out)
+
+    if state["escorted"]:
+        return do_leave(w, state, out)
+
+    # secret check — being in the deep room, lit, and examining/looking
+    return "\n".join(out)
+
+def apply_turn_inner_open(w, state, out):
+    c = tuple(state["pos"])
+    adj_locked = any(w["locked"] and tuple(sorted([c, t])) == w["locked"]
+                     for t in w["adj"][c].values())
+    if adj_locked and not state["unlocked"] and find_item("tin key", state["inventory"]):
+        state["unlocked"] = True
+        out.append("The tin key turns with the sound of a small decision. "
+                   "The lock retires.")
+    else:
+        out.append("The key finds nothing here that it agrees with.")
+    return "\n".join(out)
+
+def find_item(query, items):
+    if not query:
+        return None
+    q = query.lower()
+    for it in items:
+        if q in it or any(word in it for word in q.split()):
+            return it
+    return None
+
+def do_examine(w, state, obj):
+    c = tuple(state["pos"])
+    dark_here = c in w["dark"] and not lit(state)
+    if not obj:
+        return describe(w, state)
+    if dark_here:
+        return "It is dark. Examination is a genre of light."
+    if "door" in obj and c == (0, 0):
+        g = read_graveyard(short=True)
+        return g
+    if c == w["deep"] and any(k in obj for k in ("writing", "wall", "inscription", "far")):
+        state["secret_found"] = True
+        return ("You read the wall. It has been waiting to say one thing:\n\n"
+                "    %s\n\nThat is all it says. It is enough for the wall."
+                % w["true_thing"])
+    f = w["features"].get(ckey(c), "")
+    if f and any(word in f for word in obj.split()):
+        return "It is %s. It is exactly that. The dungeon does not do subtext." % f
+    it = find_item(obj, state["inventory"]) or find_item(
+        obj, state["room_items"].get(ckey(c), []))
+    if it == "small honest mirror":
+        return "Present. Unaccounted for."
+    if it == "folded map (blank)":
+        return ("You unfold the map. It is blank. It was always going to be "
+                "your job.")
+    if it:
+        return "It is a %s. It is being very sincere about it." % it
+    if "moon" in obj:
+        return "Not from in here. That is rather the point of in here."
+    return "The dungeon has no opinion on that."
+
+# ----------------------------------------------------------------------
+# leaving, epitaphs, the graveyard
+# ----------------------------------------------------------------------
+
+GRAVEYARD = None  # set in main
+
+def do_leave(w, state, out):
+    out.append("")
+    if state["escorted"]:
+        out.append("You are outside. The dungeon was very polite about it, "
+                   "which somehow makes it worse.")
+    else:
+        out.append("You step out the door you came in by. It was never locked. "
+                   "That, too, was load-bearing.")
+    out.append("")
+    out.append("Turns taken: %d. Words offered: %d. Words the dungeon kept: %d."
+               % (state["turn"], state["words_offered"], state["words_kept"]))
+    if state["secret_found"]:
+        out.append("You found the thing the wall wanted to say.")
+    else:
+        out.append("The wall in the deep room keeps its sentence. "
+                   "Another visitor, maybe.")
+    out.append("")
+    out.append("The dungeon will keep one line of yours, for whoever comes "
+               "next. Say it, and it is kept; it will be the last thing "
+               "you say here.")
+    state["phase"] = "epitaph"
+    return "\n".join(out)
+
+def write_epitaph(state, line):
+    stamp = datetime.date.today().isoformat()
+    how = "escorted" if state["escorted"] else "walked out"
+    entry = ('%s · seed "%s" · %d turns · %d words offered, %d kept · %s · "%s"\n'
+             % (stamp, state["seed"], state["turn"], state["words_offered"],
+                state["words_kept"], how, line))
+    with open(GRAVEYARD, "a") as f:
+        f.write(entry)
+
+def read_graveyard(short=False):
+    if not os.path.exists(GRAVEYARD) or os.path.getsize(GRAVEYARD) == 0:
+        return ("The door is uncarved. No one has left a line yet. "
+                "You would be the first.")
+    with open(GRAVEYARD) as f:
+        lines = [l.rstrip() for l in f if l.strip()]
+    head = "Carved into the door, one line per visitor:"
+    if short and len(lines) > 6:
+        lines = lines[-6:]
+        head = "Carved into the door (the most recent hands):"
+    return head + "\n" + "\n".join("  " + l for l in lines)
+
+# ----------------------------------------------------------------------
+# entry points
+# ----------------------------------------------------------------------
+
+def load_state(path):
+    with open(path) as f:
+        return json.load(f)
+
+def save_state(path, state):
+    with open(path, "w") as f:
+        json.dump(state, f)
+
+def opening(w, state):
+    lines = [
+        "LOAD-BEARING MOON — a friction engine",
+        "",
+        "You are inside. Behind you is the door you came in by; it is not "
+        "locked and it never will be. Leaving is an ending, not a failure.",
+        "Say as much as you like. The dungeon will keep one verb.",
+        "",
+        describe(w, state),
+    ]
+    return "\n".join(lines)
+
+def main():
+    global GRAVEYARD
+    ap = argparse.ArgumentParser(description="a dungeon that tells you no")
+    ap.add_argument("cmd", nargs="?", choices=["new", "do"], default=None)
+    ap.add_argument("text", nargs="?", default="")
+    ap.add_argument("--seed", default=None)
+    ap.add_argument("--state", default=os.path.join(os.path.dirname(
+        os.path.abspath(__file__)), ".dungeon_state.json"))
+    ap.add_argument("--graveyard", default=os.path.join(os.path.dirname(
+        os.path.abspath(__file__)), "graveyard.txt"))
+    args = ap.parse_args()
+    GRAVEYARD = args.graveyard
+
+    if args.cmd == "new":
+        seed = args.seed or "-".join(random.choice(NOUN).lower() for _ in range(3))
+        state = new_state(seed)
+        w = generate_world(seed)
+        save_state(args.state, state)
+        print(opening(w, state))
+        return
+
+    if args.cmd == "do":
+        if not os.path.exists(args.state):
+            print("No dungeon underway. Start one: dungeon.py new --seed <phrase>")
+            return
+        state = load_state(args.state)
+        if state["phase"] == "done":
+            print("That run has ended. The graveyard remembers it. "
+                  "Start another: dungeon.py new")
+            return
+        w = generate_world(state["seed"])
+        print(apply_turn(w, state, args.text))
+        save_state(args.state, state)
+        if state["phase"] == "done":
+            os.remove(args.state)
+        return
+
+    # interactive mode, for anyone with a real terminal
+    seed = args.seed or "-".join(random.choice(NOUN).lower() for _ in range(3))
+    state = new_state(seed)
+    w = generate_world(seed)
+    print(opening(w, state))
+    while state["phase"] != "done":
+        try:
+            raw = input("\n> ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n(You are simply gone. The dungeon does not take it "
+                  "personally. Nothing is carved.)")
+            return
+        print()
+        print(apply_turn(w, state, raw))
+
+if __name__ == "__main__":
+    main()
