@@ -5,8 +5,8 @@ a friction engine — v0.1 "the mute engine"
 
 A dungeon that tells you no.
 
-  python3 dungeon.py new --seed some-phrase-you-like
-  python3 dungeon.py do "your turn, in as many words as you want"
+  python3 dungeon new --seed some-phrase-you-like
+  python3 dungeon do "your turn, in as many words as you want"
   ...repeat...
   (walk back to the door you came in by, and: leave)
 
@@ -765,7 +765,7 @@ def main():
     ap.add_argument("--state", default=os.path.join(os.path.dirname(
         os.path.abspath(__file__)), ".dungeon_state.json"))
     ap.add_argument("--graveyard", default=os.path.join(os.path.dirname(
-        os.path.abspath(__file__)), "graveyard.txt"))
+        os.path.abspath(__file__)), "graveyard"))
     args = ap.parse_args()
     GRAVEYARD = args.graveyard
 
@@ -779,12 +779,12 @@ def main():
 
     if args.cmd == "do":
         if not os.path.exists(args.state):
-            print("No dungeon underway. Start one: dungeon.py new --seed <phrase>")
+            print("No dungeon underway. Start one: dungeon new --seed <phrase>")
             return
         state = load_state(args.state)
         if state["phase"] == "done":
             print("That run has ended. The graveyard remembers it. "
-                  "Start another: dungeon.py new")
+                  "Start another: dungeon new")
             return
         w = generate_world(state["seed"])
         print(apply_turn(w, state, args.text))
